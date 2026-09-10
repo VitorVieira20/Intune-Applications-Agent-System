@@ -58,7 +58,7 @@ def extract_parameters_node(state: AgentState):
     )
 
     # Configurar o modelo local via host.docker.internal (ou IP da rede)
-    llm = ChatOllama(model="qwen2.5:14b", format="json", temperature=0.1)
+    llm = ChatOllama(model="qwen2.5:7b", format="json", temperature=0.1)
 
     response = llm.invoke(prompt)
 

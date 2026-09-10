@@ -7,9 +7,9 @@ pede confirmação ao utilizador (Human-in-the-Loop) sempre que há ambiguidade.
 ## Pré-requisitos
 
 - Docker e Docker Compose
-- Ollama a correr **na máquina host** (não em contentor) com o modelo `qwen2.5:14b`:
+- Ollama a correr **na máquina host** (não em contentor) com o modelo `qwen2.5:7b`:
   ```bash
-  ollama pull qwen2.5:14b
+  ollama pull qwen2.5:7b
   ollama serve
   ```
 - `IntuneWinAppUtil.exe` (ferramenta oficial da Microsoft), descarregada de:

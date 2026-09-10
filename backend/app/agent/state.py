@@ -1,4 +1,4 @@
-from typing import Optional, TypedDict
+from typing import Union, Optional, TypedDict
 
 
 class AgentState(TypedDict, total=False):
@@ -9,7 +9,7 @@ class AgentState(TypedDict, total=False):
     search_context: str
     install_cmd: str
     uninstall_cmd: str
-    detection_rule: dict
+    detection_rule: Union[dict, str]
     installer_download_url: Optional[str]
     installer_is_wrapper_script: bool
     is_valid: bool
