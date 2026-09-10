@@ -61,3 +61,29 @@ Previous attempt errors to fix (empty if this is the first attempt):
 
 Extract the install command, uninstall command and detection rule now, following the system \
 constraints strictly. Output JSON only."""
+
+EXTRACT_PARAMETERS_PROMPT = """You are a Microsoft Intune packaging and deployment specialist.
+Your task is to analyze the provided context and executable metadata to determine the exact silent installation command, silent uninstallation command, and detection rule for the application: "{app_name}".
+
+{error_feedback}
+
+### REASONING RULES:
+1. Identify the installer engine (e.g., Inno Setup, NSIS, MSI, InstallShield, WiX) by looking at the "FILE METADATA" below. Look for copyright signatures or product names (e.g., "Nullsoft" = NSIS, "Jordan Russell" = Inno Setup).
+2. Priority 1: Use the exact commands from the "SILENT INSTALL HQ RESULTS" if they exist and are relevant.
+3. Priority 2: If HQ results are empty or vague, use the identified installer engine to select the correct silent switches from the "GENERAL INSTALLER CHEATSHEET".
+4. System Context: All commands MUST be strictly silent (no UI windows, no reboots allowed) and target a machine-wide / System installation (e.g., ALLUSERS=1, /ALLUSERS).
+
+### FILE METADATA (Extracted from the actual executable):
+{file_metadata}
+
+### SEARCH CONTEXT (Web results & Cheatsheet):
+{search_context}
+
+You MUST respond ONLY with a valid JSON object matching this exact schema. Do not include markdown formatting or explanations.
+{{
+  "installer_type": "The engine you identified (e.g., Inno Setup, NSIS, MSI) or Unknown",
+  "install_cmd": "Full silent install command (e.g., setup.exe /S)",
+  "uninstall_cmd": "Full silent uninstall command (e.g., uninstall.exe /S)",
+  "detection_rule": "Registry key path, exact file path, or MSI ProductCode to detect success"
+}}
+"""

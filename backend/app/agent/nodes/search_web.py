@@ -1,27 +1,51 @@
-import logging
-
+import os
 from langchain_community.tools import DuckDuckGoSearchRun
-
 from app.agent.state import AgentState
+from app.services.installer_fetcher import get_installer_metadata
 
-logger = logging.getLogger("intune_agent.node.search_web")
+# Caminho para o ficheiro local com as regras de todos os instaladores
+CHEATSHEET_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../knowledge/installer_cheatsheet.md"))
 
-_search_tool = DuckDuckGoSearchRun()
+def search_web_node(state: AgentState):
+    """Nó responsável por recolher inteligência web e metadados do ficheiro."""
+    app_name = state.get("app_name", "Aplicação Desconhecida")
+    installer_path = state.get("installer_path", "")
 
+    print(f"-> A recolher inteligência para: {app_name}")
 
-def search_web_node(state: AgentState) -> AgentState:
-    app_name = state["app_name"]
-    query = f'"{app_name}" silent install switch command line system context registry uninstall'
+    # 1. Extrair Metadados do Ficheiro Físico
+    file_metadata = get_installer_metadata(installer_path)
+    print(f"-> Metadados extraídos: {file_metadata}")
+
+    # 2. Pesquisar no Silent Install HQ
+    search = DuckDuckGoSearchRun()
+    query = f"site:silentinstallhq.com {app_name} silent install uninstall registry"
 
     try:
-        result = _search_tool.invoke(query)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("search_web falhou para '%s': %s", app_name, exc)
-        result = ""
+        search_result = search.invoke(query)
+    except Exception as e:
+        print(f"-> Erro na pesquisa web: {e}")
+        search_result = ""
 
-    context = result or "Nenhum resultado de pesquisa disponível."
+    # 3. Carregar o Cheatsheet (Fallback)
+    cheatsheet_data = ""
+    if os.path.exists(CHEATSHEET_PATH):
+        with open(CHEATSHEET_PATH, "r", encoding="utf-8") as f:
+            cheatsheet_data = f.read()
+    else:
+        print(f"-> AVISO: Ficheiro cheatsheet não encontrado em {CHEATSHEET_PATH}")
 
-    updated = dict(state)
-    existing = state.get("search_context", "")
-    updated["search_context"] = f"{existing}\n\n{context}".strip()
-    return updated
+    # 4. Construir o Contexto Combinado
+    combined_context = f"""
+    === SILENT INSTALL HQ RESULTS ===
+    {search_result if search_result.strip() else 'No specific instructions found on Silent Install HQ.'}
+
+    === GENERAL INSTALLER CHEATSHEET (FALLBACK) ===
+    {cheatsheet_data}
+    """
+
+    # Atualiza o estado com as novas informações
+    return {
+        "search_context": combined_context,
+        "file_metadata": file_metadata
+    }

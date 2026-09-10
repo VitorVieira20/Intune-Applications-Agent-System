@@ -4,6 +4,8 @@ caminho local/partilha de rede já acessível dentro do contentor.
 
 import logging
 import shutil
+import os
+import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -63,3 +65,40 @@ def fetch_installer(installer_url_or_path: str, destination_dir: Path) -> Path:
 
     logger.info("Instalador disponível em %s (%d bytes)", destination_path, destination_path.stat().st_size)
     return destination_path
+
+def get_installer_metadata(file_path: str) -> str:
+    """
+    Usa o PowerShell do Windows para ler os metadados internos do executável.
+    Isto ajuda a identificar se é Inno Setup, NSIS, InstallShield, etc.
+    """
+    if not file_path or not os.path.exists(file_path):
+        return "Ficheiro não encontrado."
+
+    if not file_path.lower().endswith(".exe"):
+        return f"Não é um ficheiro .exe (Extensão: {os.path.splitext(file_path)[1]})"
+
+    # Comando PowerShell para extrair informações do ficheiro
+    ps_command = f"""
+    try {{
+        $info = (Get-Item -Path '{file_path}').VersionInfo
+        $desc = $info.FileDescription
+        $prod = $info.ProductName
+        $copy = $info.LegalCopyright
+        Write-Output "$desc | $prod | $copy"
+    }} catch {{
+        Write-Output "Erro ao ler metadados."
+    }}
+    """
+
+    try:
+        # Corre nativamente no Windows
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_command],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        metadata = result.stdout.strip()
+        return metadata if metadata else "Sem metadados úteis."
+    except Exception as e:
+        return f"Falha na extração de metadados: {e}"

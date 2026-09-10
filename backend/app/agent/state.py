@@ -17,3 +17,5 @@ class AgentState(TypedDict, total=False):
     errors: list[str]
     correction_loops: int
     human_review_route: str
+    file_metadata: str
+    installer_path: str

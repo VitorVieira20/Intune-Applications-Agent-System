@@ -1,6 +1,7 @@
 import json
 import logging
 
+from app.agent.prompts import EXTRACT_PARAMETERS_PROMPT
 from langchain_ollama import ChatOllama
 
 from app.agent.prompts import EXTRACTION_SYSTEM_PROMPT, EXTRACTION_USER_TEMPLATE
@@ -31,35 +32,56 @@ def _safe_json_parse(raw: str) -> dict:
         raise
 
 
-def extract_parameters_node(state: AgentState) -> AgentState:
-    previous_errors = "\n".join(state.get("errors", [])) or "None"
+def extract_parameters_node(state: AgentState):
+    """Usa o Ollama para extrair ou corrigir os comandos de instalação."""
+    app_name = state.get("app_name", "Aplicação")
+    search_context = state.get("search_context", "")
+    file_metadata = state.get("file_metadata", "")
+    errors = state.get("errors", [])
 
-    user_prompt = EXTRACTION_USER_TEMPLATE.format(
-        app_name=state["app_name"],
-        search_context=state.get("search_context", "")[:6000],
-        previous_errors=previous_errors,
+    # Construir o bloco de feedback se o Sandbox tiver reprovado uma tentativa anterior
+    error_feedback = ""
+    if errors:
+        error_feedback = "### CRITICAL FEEDBACK FROM PREVIOUS ATTEMPT:\n"
+        error_feedback += "Your previous commands failed in the Windows Sandbox test for the following reasons:\n"
+        for err in errors:
+            error_feedback += f"- {err}\n"
+        error_feedback += "WARNING: You MUST change the install_cmd or uninstall_cmd flags to fix these issues. Do not suggest the exact same commands again.\n"
+        print(f"-> A pedir correção ao LLM baseada nos erros: {errors[-1]}")
+
+    # Formatar o prompt final
+    prompt = EXTRACT_PARAMETERS_PROMPT.format(
+        app_name=app_name,
+        error_feedback=error_feedback,
+        file_metadata=file_metadata,
+        search_context=search_context
     )
 
-    messages = [
-        ("system", EXTRACTION_SYSTEM_PROMPT),
-        ("human", user_prompt),
-    ]
+    # Configurar o modelo local via host.docker.internal (ou IP da rede)
+    llm = ChatOllama(model="qwen2.5:14b", format="json", temperature=0.1)
 
-    updated = dict(state)
+    response = llm.invoke(prompt)
+
+    # Limpeza rigorosa do JSON (Remove blocos de markdown ```json )
+    raw_content = response.content.strip()
+    if raw_content.startswith("```json"):
+        raw_content = raw_content[7:]
+    if raw_content.startswith("```"):
+        raw_content = raw_content[3:]
+    if raw_content.endswith("```"):
+        raw_content = raw_content[:-3]
 
     try:
-        response = _llm.invoke(messages)
-        parsed = _safe_json_parse(response.content)
-
-        updated["install_cmd"] = parsed.get("install_cmd", "")
-        updated["uninstall_cmd"] = parsed.get("uninstall_cmd", "")
-        updated["detection_rule"] = parsed.get("detection_rule", {}) or {}
-        updated["installer_download_url"] = parsed.get("installer_download_url") or None
-        updated["errors"] = []
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("extract_parameters falhou")
-        updated["errors"] = state.get("errors", []) + [f"Falha ao invocar/parsear LLM: {exc}"]
-        updated["is_valid"] = False
-
-    updated["correction_loops"] = state.get("correction_loops", 0) + 1
-    return updated
+        data = json.loads(raw_content.strip())
+        return {
+            "install_cmd": data.get("install_cmd", "Not found"),
+            "uninstall_cmd": data.get("uninstall_cmd", "Not found"),
+            "detection_rule": data.get("detection_rule", "Not found"),
+            # Limpamos a flag de validação para forçar um novo teste na Sandbox
+            "is_valid": None
+        }
+    except json.JSONDecodeError as e:
+        print(f"-> Erro no parse do JSON: {e}")
+        # Adiciona erro ao estado para o LLM tentar estruturar melhor
+        errors.append("Invalid JSON output format.")
+        return {"install_cmd": "", "uninstall_cmd": "", "detection_rule": "", "errors": errors}

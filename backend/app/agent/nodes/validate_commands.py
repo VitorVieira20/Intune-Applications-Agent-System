@@ -1,76 +1,170 @@
-import logging
-import re
+import os
+import json
+import time
+import subprocess
 
+from langgraph.graph import END
 from app.agent.state import AgentState
 
-logger = logging.getLogger("intune_agent.node.validate_commands")
+def validate_commands_node(state: AgentState):
+    """
+    Testa dinamicamente os comandos gerados usando a Windows Sandbox.
+    Garante que a instalação é silenciosa (sem UI) e funcional.
+    """
+    installer_path = state.get("installer_path")
+    install_cmd = state.get("install_cmd")
+    app_name = state.get("app_name", "Aplicação")
 
-SILENT_FLAGS = [
-    r"/qn\b", r"/quiet\b", r"/s\b", r"-s\b", r"/silent\b", r"/verysilent\b",
-    r"/q\b", r"--silent\b", r"--quiet\b", r"/norestart\b",
-]
+    if not installer_path or not os.path.exists(installer_path):
+        errors = state.get("errors", [])
+        errors.append("Ficheiro executável não encontrado para teste.")
+        return {"is_valid": False, "errors": errors}
 
-SYSTEM_CONTEXT_FLAGS = [
-    r"allusers\s*=\s*1", r"/allusers\b", r"machine", r"/m\b",
-]
+    print(f"\n-> A iniciar teste na Sandbox para: {app_name}")
+    print(f"-> Comando a testar: {install_cmd}")
 
-MSI_UNINSTALL_PATTERN = re.compile(r"msiexec.*?/x", re.IGNORECASE)
+    # Configuração de Caminhos Absolutos
+    shared_folder_host = os.path.dirname(os.path.abspath(installer_path))
 
+    # Caminhos dentro da Sandbox
+    shared_folder_guest = "C:\\TempInstall"
+    result_file_host = os.path.join(shared_folder_host, "resultado.json")
+    result_file_guest = f"{shared_folder_guest}\\resultado.json"
+    monitor_file_host = os.path.join(shared_folder_host, "monitor.ps1")
+    wsb_file_host = os.path.join(shared_folder_host, "test.wsb")
 
-def _matches_any(patterns: list[str], text: str) -> bool:
-    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+    # Limpa resultados anteriores
+    if os.path.exists(result_file_host):
+        os.remove(result_file_host)
 
+    # 1. O Script Espião em PowerShell
+    ps_script = f"""
+    $ResultFile = "{result_file_guest}"
+    $ErrorActionPreference = "SilentlyContinue"
 
-def validate_commands_node(state: AgentState) -> AgentState:
-    install_cmd = (state.get("install_cmd") or "").strip()
-    uninstall_cmd = (state.get("uninstall_cmd") or "").strip()
-    detection_rule = state.get("detection_rule") or {}
+    $Output = @{{
+        InstallSuccess = $false
+        HasUI = $false
+        ErrorMessage = ""
+    }}
 
-    errors: list[str] = []
+    try {{
+        $Process = Start-Process -FilePath "cmd.exe" -ArgumentList "/c cd {shared_folder_guest} && {install_cmd}" -PassThru -WindowStyle Hidden
+        $TimeoutSeconds = 300
+        $Timer = 0
 
-    if not install_cmd:
-        errors.append("install_cmd está vazio.")
-    else:
-        if not _matches_any(SILENT_FLAGS, install_cmd):
-            errors.append(
-                f"install_cmd não contém nenhuma flag silenciosa reconhecida "
-                f"(/qn, /quiet, /S, /VERYSILENT, etc.): '{install_cmd}'"
-            )
-        is_msi = install_cmd.lower().startswith("msiexec") or ".msi" in install_cmd.lower()
-        if is_msi and "allusers" not in install_cmd.lower():
-            errors.append("Instalador MSI detetado mas falta ALLUSERS=1 para contexto de Sistema.")
-        if not is_msi and not _matches_any(SYSTEM_CONTEXT_FLAGS, install_cmd):
-            errors.append(
-                "install_cmd não indica claramente instalação para todo o sistema "
-                "(machine-wide / ALLUSERS). Verificar flag específica do instalador."
-            )
+        while (-not $Process.HasExited) {{
+            Start-Sleep -Seconds 1
+            $Timer++
 
-    if not uninstall_cmd:
-        errors.append("uninstall_cmd está vazio.")
-    elif not _matches_any(SILENT_FLAGS, uninstall_cmd) and not MSI_UNINSTALL_PATTERN.search(uninstall_cmd):
-        errors.append(f"uninstall_cmd não parece ser silencioso: '{uninstall_cmd}'")
+            $ChildProcesses = Get-CimInstance Win32_Process | Where-Object {{ $_.ParentProcessId -eq $Process.Id }}
+            foreach ($child in $ChildProcesses) {{
+                $p = Get-Process -Id $child.ProcessId
+                if ($p -and $p.MainWindowHandle -ne 0) {{
+                    $Output.HasUI = $true
+                    $Output.ErrorMessage = "A instalação falhou: Uma janela gráfica (UI) foi detetada."
+                    Stop-Process -Id $p.Id -Force
+                    break
+                }}
+            }}
 
-    if not detection_rule or not detection_rule.get("type"):
-        errors.append("detection_rule ausente ou sem 'type' definido (msi/file/registry).")
-    elif detection_rule.get("type") == "msi" and not detection_rule.get("product_code"):
-        errors.append("detection_rule do tipo 'msi' sem 'product_code'.")
-    elif detection_rule.get("type") in ("file", "registry") and not detection_rule.get("path_or_key"):
-        errors.append(f"detection_rule do tipo '{detection_rule.get('type')}' sem 'path_or_key'.")
+            if ($Timer -ge $TimeoutSeconds) {{
+                $Output.ErrorMessage = "A instalação falhou: Excedeu o limite de 5 minutos."
+                Stop-Process -Id $Process.Id -Force
+                break
+            }}
+        }}
 
-    is_valid = len(errors) == 0
-    logger.info("validate_commands: is_valid=%s erros=%s", is_valid, errors)
+        if (-not $Output.HasUI -and $Output.ErrorMessage -eq "") {{
+            if ($Process.ExitCode -eq 0 -or $Process.ExitCode -eq 3010) {{
+                $Output.InstallSuccess = $true
+            }} else {{
+                $Output.ErrorMessage = "A instalação falhou com o Exit Code: " + $Process.ExitCode
+            }}
+        }}
+    }} catch {{
+        $Output.ErrorMessage = $_.Exception.Message
+    }}
 
-    updated = dict(state)
-    updated["is_valid"] = is_valid
-    updated["errors"] = errors
-    return updated
+    $Output | ConvertTo-Json | Out-File -FilePath $ResultFile -Encoding UTF8
+    Stop-Computer -Force
+    """
+
+    with open(monitor_file_host, "w", encoding="utf-8") as f:
+        f.write(ps_script)
+
+    # 2. Configuração da Sandbox (.wsb)
+    wsb_content = f"""
+    <Configuration>
+      <MappedFolders>
+        <MappedFolder>
+          <HostFolder>{shared_folder_host}</HostFolder>
+          <SandboxFolder>{shared_folder_guest}</SandboxFolder>
+          <ReadOnly>false</ReadOnly>
+        </MappedFolder>
+      </MappedFolders>
+      <LogonCommand>
+        <Command>powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File {shared_folder_guest}\\monitor.ps1</Command>
+      </LogonCommand>
+    </Configuration>
+    """
+
+    with open(wsb_file_host, "w", encoding="utf-8") as f:
+        f.write(wsb_content)
+
+    # 3. Lançar a Windows Sandbox
+    print("-> A lançar a Windows Sandbox... (isto pode demorar alguns segundos)")
+    subprocess.Popen(["cmd.exe", "/c", "start", wsb_file_host], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # 4. Aguardar pelo Relatório
+    timeout = 320
+    start_time = time.time()
+
+    while not os.path.exists(result_file_host):
+        if time.time() - start_time > timeout:
+            errors = state.get("errors", [])
+            errors.append("Teste falhou: A Sandbox não devolveu resposta (Timeout).")
+            return {"is_valid": False, "errors": errors}
+        time.sleep(2)
+
+    # 5. Ler Resultado
+    try:
+        with open(result_file_host, "r", encoding="utf-8") as f:
+            result = json.load(f)
+
+        if result.get("InstallSuccess") and not result.get("HasUI"):
+            print("-> SUCESSO: A Sandbox confirmou a instalação silenciosa!")
+            return {"is_valid": True, "errors": []}
+        else:
+            error_msg = result.get("ErrorMessage", "Erro desconhecido na instalação.")
+            print(f"-> FALHA NA SANDBOX: {error_msg}")
+
+            errors = state.get("errors", [])
+            errors.append(error_msg)
+            return {"is_valid": False, "errors": errors}
+
+    except Exception as e:
+        errors = state.get("errors", [])
+        errors.append(f"Erro ao ler o ficheiro resultado.json: {e}")
+        return {"is_valid": False, "errors": errors}
 
 
 def route_after_validate(state: AgentState) -> str:
-    from app.config import settings
+    """
+    Decide o próximo passo após a validação da Sandbox.
+    Implementa um limite de tentativas para evitar loops infinitos.
+    """
+    is_valid = state.get("is_valid")
+    errors = state.get("errors", [])
 
-    if state.get("is_valid"):
+    if is_valid:
+        # A chave "package_app" no graph.py mapeia para o próximo passo
         return "package_app"
-    if state.get("correction_loops", 0) >= settings.max_correction_loops:
+
+    if len(errors) >= 3:
+        print("\n-> [ALERTA] Limite de 3 tentativas falhadas atingido.")
+        print("-> O agente não conseguiu encontrar um comando silencioso válido. A abortar...")
         return "end"
+
+    print(f"-> A redirecionar para o LLM para corrigir o erro (Tentativa {len(errors)}/3)...")
     return "extract_parameters"
